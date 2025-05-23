@@ -22,7 +22,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 
 public class TestConcurrency extends TestBase {
 
@@ -65,7 +64,7 @@ public class TestConcurrency extends TestBase {
 
     long start = System.currentTimeMillis();
 
-    final int numberOfExecutions = 20;
+    final int numberOfExecutions = 50;
     try (ExecutorService exService = Executors.newFixedThreadPool(numberOfExecutions)) {
       List<Future<?>> futures = new ArrayList<>();
       for (int i = 0; i < numberOfExecutions; i++) {
@@ -117,10 +116,10 @@ public class TestConcurrency extends TestBase {
   }
 
   private void loadData() {
-    runSQLScript("hundredsSeats.sql");
+    runSQLScript("hundredsSeats.sql", ";");
   }
 
   private void cleanTables() {
-    runSQLScript("dataCleaner.sql");
+    runSQLScript("dataCleaner.sql", ";");
   }
 }

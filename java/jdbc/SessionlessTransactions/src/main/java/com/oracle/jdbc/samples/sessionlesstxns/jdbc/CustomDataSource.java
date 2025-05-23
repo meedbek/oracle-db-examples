@@ -18,9 +18,6 @@ import java.util.UUID;
 
 @Component
 public class CustomDataSource {
-
-  private static final Logger logger = LoggerFactory.getLogger(CustomDataSource.class);
-
   public final DataSource connectionPool;
   private final Map<String, OracleConnection> connectionList;
 
@@ -33,7 +30,6 @@ public class CustomDataSource {
     OracleConnection conn = (OracleConnection) connectionPool.getConnection();
     String uuid = UUID.randomUUID().toString();
 
-    logger.info("Number of active connections is {}", connectionList.size());
     connectionList.put(uuid, conn);
 
     return Map.entry(uuid, conn);
