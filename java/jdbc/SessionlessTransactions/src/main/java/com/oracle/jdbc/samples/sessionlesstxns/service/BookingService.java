@@ -17,6 +17,7 @@ import com.oracle.jdbc.samples.sessionlesstxns.exception.NoFreeSeatFoundExceptio
 import com.oracle.jdbc.samples.sessionlesstxns.exception.NoTicketFoundException;
 import com.oracle.jdbc.samples.sessionlesstxns.exception.TransactionNotFoundException;
 import com.oracle.jdbc.samples.sessionlesstxns.exception.UnexpectedException;
+import com.oracle.jdbc.samples.sessionlesstxns.jdbc.CustomDataSource;
 import com.oracle.jdbc.samples.sessionlesstxns.util.Util;
 import oracle.jdbc.OracleConnection;
 import oracle.jdbc.OraclePreparedStatement;
@@ -31,31 +32,36 @@ import java.sql.Savepoint;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @Service
 public class BookingService {
-  DataSource connectionPool;
+  CustomDataSource connectionPool;
   PaymentService paymentService;
   static final int INTEGRITY_CONSTRAINT_ERROR = 2291;
   static final int TRANSACTION_NOT_FOUND_ERROR = 26218;
 
-  public BookingService(DataSource dataSource, @SuppressWarnings("SpringJavaInjectionPointsAutowiringInspection") PaymentService paymentService) {
+  public BookingService(CustomDataSource dataSource, @SuppressWarnings("SpringJavaInjectionPointsAutowiringInspection") PaymentService paymentService) {
     this.connectionPool = dataSource;
     this.paymentService = paymentService;
   }
 
   public StartTransactionResponse startTransaction(StartTransactionRequest body) {
-    try (OracleConnection conn = (OracleConnection) connectionPool.getConnection();
-         AutoCloseable rollback = conn::rollback;) {
+
+    try {
+      Map.Entry<String, OracleConnection> newConn = connectionPool.getNewConnection();
+      OracleConnection conn = newConn.getValue();
+      String gtrid = newConn.getKey();
       conn.setAutoCommit(false);
-      byte[] gtrid = conn.startTransaction(body.timeout() * 60);
-
-      long bookingId = createBooking(conn);
-
-      List<Long> seats = lockAndBookSeats(conn, bookingId, body.flightId(), body.count());
-      conn.suspendTransaction();
-
-      return new StartTransactionResponse(bookingId, Util.byteArrayToHex(gtrid), seats.size(), seats);
+      try {
+        long bookingId = createBooking(conn);
+        List<Long> seats = lockAndBookSeats(conn, bookingId, body.flightId(), body.count());
+        return new StartTransactionResponse(bookingId, gtrid, seats.size(), seats);
+      } catch(Exception ex) {
+        conn.rollback();
+        connectionPool.releaseConnection(gtrid);
+        throw ex;
+      }
     } catch (APIException ex) {
       throw ex;
     } catch (Exception ex) {
@@ -64,20 +70,15 @@ public class BookingService {
   }
 
   public RequestTicketsResponse requestTickets(Long bookingId, RequestTicketsRequest body) {
-    try (OracleConnection conn = (OracleConnection) connectionPool.getConnection();
-         AutoCloseable suspend = conn::suspendTransaction;) {
+    try {
+      OracleConnection conn = connectionPool.getConnection(body.transactionId());
+      if (conn == null) {
+        throw new TransactionNotFoundException(body.transactionId());
+      }
       conn.setAutoCommit(false);
-
-      conn.resumeTransaction(Util.hexToByteArray(body.transactionId()));
-
       List<Long> seats = lockAndBookSeats(conn, bookingId, body.flightId(), body.count());
 
       return new RequestTicketsResponse(seats.size(), seats);
-    } catch (SQLException ex) {
-      if (ex.getErrorCode() == TRANSACTION_NOT_FOUND_ERROR) {
-        throw new TransactionNotFoundException(body.transactionId());
-      }
-      throw new UnexpectedException(ex);
     } catch (APIException ex) {
       throw ex;
     } catch (Exception ex) {
@@ -86,17 +87,14 @@ public class BookingService {
   }
 
   public void removeTicket(Long bookingId, Long seatId, String transactionId) {
-    try (OracleConnection conn = (OracleConnection) connectionPool.getConnection();
-         AutoCloseable suspend = conn::suspendTransaction;) {
-      conn.setAutoCommit(false);
-      conn.resumeTransaction(Util.hexToByteArray(transactionId));
-
-      removeTicket(conn, seatId, bookingId);
-    } catch (SQLException ex) {
-      if (ex.getErrorCode() == TRANSACTION_NOT_FOUND_ERROR) {
+    try {
+      OracleConnection conn = connectionPool.getConnection(transactionId);
+      if (conn == null) {
         throw new TransactionNotFoundException(transactionId);
       }
-      throw new UnexpectedException(ex);
+      conn.setAutoCommit(false);
+
+      removeTicket(conn, seatId, bookingId);
     } catch (APIException ex) {
       throw ex;
     } catch (Exception ex) {
@@ -110,24 +108,18 @@ public class BookingService {
     String receipt;
     List<CheckoutResponse.TicketDTO> tickets;
 
-    try (OracleConnection conn = (OracleConnection) connectionPool.getConnection();) {
-      conn.setAutoCommit(false);
-      conn.resumeTransaction(gtrid);
-      try {
-        tickets = getTickets(conn, bookingId);
-        sum = tickets.stream().map(CheckoutResponse.TicketDTO::price).reduce(0F, Float::sum);
-        receipt = paymentService.pay(sum, checkoutDetails.paymentMethod());
-        saveReceipt(conn, receipt, sum, bookingId, checkoutDetails.paymentMethod());
-      } catch (Exception ex) {
-        conn.suspendTransaction();
-        throw ex;
-      }
-      conn.commit();
-    } catch (SQLException ex) {
-      if (ex.getErrorCode() == TRANSACTION_NOT_FOUND_ERROR) {
+    try {
+      OracleConnection conn = connectionPool.getConnection(checkoutDetails.transactionId());
+      if (conn == null) {
         throw new TransactionNotFoundException(checkoutDetails.transactionId());
       }
-      throw new UnexpectedException(ex);
+      tickets = getTickets(conn, bookingId);
+      sum = tickets.stream().map(CheckoutResponse.TicketDTO::price).reduce(0F, Float::sum);
+      receipt = paymentService.pay(sum, checkoutDetails.paymentMethod());
+      saveReceipt(conn, receipt, sum, bookingId, checkoutDetails.paymentMethod());
+
+      conn.commit();
+      connectionPool.releaseConnection(checkoutDetails.transactionId());
     } catch (APIException ex) {
       throw ex;
     } catch (Exception ex) {
@@ -138,15 +130,14 @@ public class BookingService {
   }
 
   public void cancelBooking(String transactionId) {
-    try (OracleConnection conn = (OracleConnection) connectionPool.getConnection();) {
-      conn.setAutoCommit(false);
-      conn.resumeTransaction(Util.hexToByteArray(transactionId));
-      conn.rollback();
-    } catch (SQLException ex) {
-      if (ex.getErrorCode() == TRANSACTION_NOT_FOUND_ERROR) {
+    try {
+      OracleConnection conn = connectionPool.getConnection(transactionId);
+      if (conn == null) {
         throw new TransactionNotFoundException(transactionId);
       }
-      throw new UnexpectedException(ex);
+      conn.setAutoCommit(false);
+      conn.rollback();
+      connectionPool.releaseConnection(transactionId);
     } catch (APIException ex) {
       throw ex;
     } catch (Exception ex) {
